@@ -77,7 +77,7 @@ func lcm(a uint32, b uint32) uint32 {
 	return (a * b) / gcd(a, b)
 }
 
-func makeTable(l uint32, slcmlen uint32, dlcmlen uint32) ([]uint32, []uint32) {
+func makeTable(l uint32, dlcmlen uint32, slcmlen uint32) ([]uint32, []uint32) {
 	tt := make([]uint32, l+1)
 	ft := make([]uint32, l+1)
 	for i := uint32(0); i <= l; i++ {

@@ -12,7 +12,7 @@ type u16NRGBA struct {
 	Pix  []uint16
 }
 
-func NRGBAGamma(ctx context.Context, src *image.NRGBA, dest *image.NRGBA, gamma float64) error {
+func NRGBAGamma(ctx context.Context, dest *image.NRGBA, src *image.NRGBA, gamma float64) error {
 	sw, sh := src.Rect.Dx(), src.Rect.Dy()
 	dw, dh := dest.Rect.Dx(), dest.Rect.Dy()
 	if sw < dw || sh < dh {
@@ -57,16 +57,16 @@ func NRGBAGamma(ctx context.Context, src *image.NRGBA, dest *image.NRGBA, gamma 
 					Pix:  make([]uint16, (dw<<2)*sh),
 					Rect: image.Rect(0, 0, dw, sh),
 				}
-				horz16NRGBAParallel(ctx, tmpSrc, tmp)
+				horz16NRGBAParallel(ctx, tmp, tmpSrc)
 				if h.Aborted() {
 					return
 				}
-				vert16NRGBAParallel(ctx, tmp, tmpDest)
+				vert16NRGBAParallel(ctx, tmpDest, tmp)
 			} else {
-				vert16NRGBAParallel(ctx, tmpSrc, tmpDest)
+				vert16NRGBAParallel(ctx, tmpDest, tmpSrc)
 			}
 		} else {
-			horz16NRGBAParallel(ctx, tmpSrc, tmpDest)
+			horz16NRGBAParallel(ctx, tmpDest, tmpSrc)
 		}
 		if h.Aborted() {
 			return
@@ -85,7 +85,7 @@ func NRGBAGamma(ctx context.Context, src *image.NRGBA, dest *image.NRGBA, gamma 
 	return h.Wait(ctx)
 }
 
-func RGBAGamma(ctx context.Context, src *image.RGBA, dest *image.RGBA, gamma float64) error {
+func RGBAGamma(ctx context.Context, dest *image.RGBA, src *image.RGBA, gamma float64) error {
 	sw, sh := src.Rect.Dx(), src.Rect.Dy()
 	dw, dh := dest.Rect.Dx(), dest.Rect.Dy()
 	if sw < dw || sh < dh {
@@ -133,16 +133,16 @@ func RGBAGamma(ctx context.Context, src *image.RGBA, dest *image.RGBA, gamma flo
 					Pix:  make([]uint16, (dw<<2)*sh),
 					Rect: image.Rect(0, 0, dw, sh),
 				}
-				horz16NRGBAParallel(ctx, tmpSrc, tmp)
+				horz16NRGBAParallel(ctx, tmp, tmpSrc)
 				if h.Aborted() {
 					return
 				}
-				vert16NRGBAParallel(ctx, tmp, tmpDest)
+				vert16NRGBAParallel(ctx, tmpDest, tmp)
 			} else {
-				vert16NRGBAParallel(ctx, tmpSrc, tmpDest)
+				vert16NRGBAParallel(ctx, tmpDest, tmpSrc)
 			}
 		} else {
-			horz16NRGBAParallel(ctx, tmpSrc, tmpDest)
+			horz16NRGBAParallel(ctx, tmpDest, tmpSrc)
 		}
 		if h.Aborted() {
 			return
@@ -171,7 +171,7 @@ func RGBAGamma(ctx context.Context, src *image.RGBA, dest *image.RGBA, gamma flo
 	return h.Wait(ctx)
 }
 
-func horz16NRGBAParallel(ctx context.Context, src *u16NRGBA, dest *u16NRGBA) error {
+func horz16NRGBAParallel(ctx context.Context, dest *u16NRGBA, src *u16NRGBA) error {
 	n := runtime.GOMAXPROCS(0)
 	for n > 1 && n<<1 > dest.Rect.Dy() {
 		n--
@@ -180,7 +180,7 @@ func horz16NRGBAParallel(ctx context.Context, src *u16NRGBA, dest *u16NRGBA) err
 	sw, dw := uint32(src.Rect.Dx()), uint32(dest.Rect.Dx())
 	lcmlen := lcm(sw, dw)
 	slcmlen, dlcmlen := lcmlen/sw, lcmlen/dw
-	tt, ft := makeTable(dw, slcmlen, dlcmlen)
+	tt, ft := makeTable(dw, dlcmlen, slcmlen)
 	dh := uint32(dest.Rect.Dy())
 
 	h := &handle{}
@@ -195,7 +195,7 @@ func horz16NRGBAParallel(ctx context.Context, src *u16NRGBA, dest *u16NRGBA) err
 	return h.Wait(ctx)
 }
 
-func vert16NRGBAParallel(ctx context.Context, src *u16NRGBA, dest *u16NRGBA) error {
+func vert16NRGBAParallel(ctx context.Context, dest *u16NRGBA, src *u16NRGBA) error {
 	n := runtime.GOMAXPROCS(0)
 	for n > 1 && n<<1 > dest.Rect.Dx() {
 		n--
@@ -205,7 +205,7 @@ func vert16NRGBAParallel(ctx context.Context, src *u16NRGBA, dest *u16NRGBA) err
 	sh, dh := uint32(src.Rect.Dy()), uint32(dest.Rect.Dy())
 	lcmlen := lcm(sh, dh)
 	slcmlen, dlcmlen := lcmlen/sh, lcmlen/dh
-	tt, ft := makeTable(dh, slcmlen, dlcmlen)
+	tt, ft := makeTable(dh, dlcmlen, slcmlen)
 
 	h := &handle{}
 	h.wg.Add(n)
