@@ -57,10 +57,10 @@ func nnInner(h *handle, yMin int, yMax int, dPix []byte, sPix []byte, dw int, dh
 		if dy&7 == 7 && h.Aborted() {
 			return
 		}
-		s := sPix[int(float32(dy)*my+0.5)*swx4:]
+		s := sPix[int((float32(dy)+0.5)*my)*swx4:]
 		d := dPix[dy*dwx4:]
-		for dx, sx := (0), (0); dx < dwx4; dx += 4 {
-			sx = int(float32(dx>>2)*mx+0.5) << 2
+		for dx, sx := 0, 0; dx < dwx4; dx += 4 {
+			sx = int((float32(dx>>2)+0.5)*mx) << 2
 			d[dx+3] = s[sx+3]
 			d[dx+2] = s[sx+2]
 			d[dx+1] = s[sx+1]
