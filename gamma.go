@@ -34,7 +34,7 @@ func NRGBAGamma(ctx context.Context, dest *image.NRGBA, src *image.NRGBA, gamma 
 			Rect: src.Rect,
 		}
 		tmpDest := &u16NRGBA{
-			Pix:  tmpSrc.Pix[:len(dest.Pix)],
+			Pix:  make([]uint16, len(dest.Pix)),
 			Rect: dest.Rect,
 		}
 
@@ -107,7 +107,7 @@ func RGBAGamma(ctx context.Context, dest *image.RGBA, src *image.RGBA, gamma flo
 			Rect: src.Rect,
 		}
 		tmpDest := &u16NRGBA{
-			Pix:  tmpSrc.Pix[:len(dest.Pix)],
+			Pix:  make([]uint16, len(dest.Pix)),
 			Rect: dest.Rect,
 		}
 
