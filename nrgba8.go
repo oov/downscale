@@ -24,22 +24,22 @@ func NRGBA(ctx context.Context, dest *image.NRGBA, src *image.NRGBA) error {
 		if sh != dh {
 			if sw != dw {
 				tmp := image.NewNRGBA(image.Rect(0, 0, dw, sh))
-				horz8NRGBAParallel(ctx, tmp, src)
+				horz8NRGBA(ctx, tmp, src)
 				if h.Aborted() {
 					return
 				}
-				vert8NRGBAParallel(ctx, dest, tmp)
+				vert8NRGBA(ctx, dest, tmp)
 			} else {
-				vert8NRGBAParallel(ctx, dest, src)
+				vert8NRGBA(ctx, dest, src)
 			}
 		} else {
-			horz8NRGBAParallel(ctx, dest, src)
+			horz8NRGBA(ctx, dest, src)
 		}
 	}()
 	return h.Wait(ctx)
 }
 
-func horz8NRGBAParallel(ctx context.Context, dest *image.NRGBA, src *image.NRGBA) error {
+func horz8NRGBA(ctx context.Context, dest *image.NRGBA, src *image.NRGBA) error {
 	n := runtime.GOMAXPROCS(0)
 	for n > 1 && n<<1 > dest.Rect.Dy() {
 		n--
@@ -63,7 +63,7 @@ func horz8NRGBAParallel(ctx context.Context, dest *image.NRGBA, src *image.NRGBA
 	return h.Wait(ctx)
 }
 
-func vert8NRGBAParallel(ctx context.Context, dest *image.NRGBA, src *image.NRGBA) error {
+func vert8NRGBA(ctx context.Context, dest *image.NRGBA, src *image.NRGBA) error {
 	n := runtime.GOMAXPROCS(0)
 	for n > 1 && n<<1 > dest.Rect.Dx() {
 		n--

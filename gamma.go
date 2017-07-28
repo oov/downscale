@@ -57,16 +57,16 @@ func NRGBAGamma(ctx context.Context, dest *image.NRGBA, src *image.NRGBA, gamma 
 					Pix:  make([]uint16, (dw<<2)*sh),
 					Rect: image.Rect(0, 0, dw, sh),
 				}
-				horz16NRGBAParallel(ctx, tmp, tmpSrc)
+				horz16NRGBA(ctx, tmp, tmpSrc)
 				if h.Aborted() {
 					return
 				}
-				vert16NRGBAParallel(ctx, tmpDest, tmp)
+				vert16NRGBA(ctx, tmpDest, tmp)
 			} else {
-				vert16NRGBAParallel(ctx, tmpDest, tmpSrc)
+				vert16NRGBA(ctx, tmpDest, tmpSrc)
 			}
 		} else {
-			horz16NRGBAParallel(ctx, tmpDest, tmpSrc)
+			horz16NRGBA(ctx, tmpDest, tmpSrc)
 		}
 		if h.Aborted() {
 			return
@@ -133,16 +133,16 @@ func RGBAGamma(ctx context.Context, dest *image.RGBA, src *image.RGBA, gamma flo
 					Pix:  make([]uint16, (dw<<2)*sh),
 					Rect: image.Rect(0, 0, dw, sh),
 				}
-				horz16NRGBAParallel(ctx, tmp, tmpSrc)
+				horz16NRGBA(ctx, tmp, tmpSrc)
 				if h.Aborted() {
 					return
 				}
-				vert16NRGBAParallel(ctx, tmpDest, tmp)
+				vert16NRGBA(ctx, tmpDest, tmp)
 			} else {
-				vert16NRGBAParallel(ctx, tmpDest, tmpSrc)
+				vert16NRGBA(ctx, tmpDest, tmpSrc)
 			}
 		} else {
-			horz16NRGBAParallel(ctx, tmpDest, tmpSrc)
+			horz16NRGBA(ctx, tmpDest, tmpSrc)
 		}
 		if h.Aborted() {
 			return
@@ -171,7 +171,7 @@ func RGBAGamma(ctx context.Context, dest *image.RGBA, src *image.RGBA, gamma flo
 	return h.Wait(ctx)
 }
 
-func horz16NRGBAParallel(ctx context.Context, dest *u16NRGBA, src *u16NRGBA) error {
+func horz16NRGBA(ctx context.Context, dest *u16NRGBA, src *u16NRGBA) error {
 	n := runtime.GOMAXPROCS(0)
 	for n > 1 && n<<1 > dest.Rect.Dy() {
 		n--
@@ -195,7 +195,7 @@ func horz16NRGBAParallel(ctx context.Context, dest *u16NRGBA, src *u16NRGBA) err
 	return h.Wait(ctx)
 }
 
-func vert16NRGBAParallel(ctx context.Context, dest *u16NRGBA, src *u16NRGBA) error {
+func vert16NRGBA(ctx context.Context, dest *u16NRGBA, src *u16NRGBA) error {
 	n := runtime.GOMAXPROCS(0)
 	for n > 1 && n<<1 > dest.Rect.Dx() {
 		n--
