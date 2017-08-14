@@ -115,7 +115,12 @@ func RGBAGamma(ctx context.Context, dest *image.RGBA, src *image.RGBA, gamma flo
 			s, d := src.Pix, tmpSrc.Pix
 			var a uint32
 			for i := 0; i < len(d); i += 4 {
-				if a = uint32(s[i+3]); a > 0 {
+				if a = uint32(s[i+3]); a == 255 {
+					d[i+3] = 65535
+					d[i+0] = t8[s[i+0]]
+					d[i+1] = t8[s[i+1]]
+					d[i+2] = t8[s[i+2]]
+				} else if a > 0 {
 					d[i+3] = uint16(a * 0x101)
 					d[i+0] = t8[uint32(s[i+0])*255/a]
 					d[i+1] = t8[uint32(s[i+1])*255/a]
@@ -152,18 +157,23 @@ func RGBAGamma(ctx context.Context, dest *image.RGBA, src *image.RGBA, gamma flo
 			s, d := tmpDest.Pix, dest.Pix
 			var a uint32
 			for i := 0; i < len(d); i += 4 {
-				if s[i+3] > 0 {
-					a = uint32(s[i+3]) >> 8
+				if a = uint32(s[i+3]); a == 65535 {
+					d[i+3] = 255
+					d[i+0] = t16[s[i+0]]
+					d[i+1] = t16[s[i+1]]
+					d[i+2] = t16[s[i+2]]
+				} else if a == 0 {
+					d[i+3] = 0
+					d[i+0] = 0
+					d[i+1] = 0
+					d[i+2] = 0
+				} else {
+					a >>= 8
 					d[i+3] = uint8(a)
 					a *= 32897
 					d[i+0] = uint8(uint32(t16[s[i+0]]) * a >> 23)
 					d[i+1] = uint8(uint32(t16[s[i+1]]) * a >> 23)
 					d[i+2] = uint8(uint32(t16[s[i+2]]) * a >> 23)
-				} else {
-					d[i+3] = 0
-					d[i+0] = 0
-					d[i+1] = 0
-					d[i+2] = 0
 				}
 			}
 		}
@@ -256,12 +266,7 @@ func horz16NRGBAInner(h *handle, s []uint16, d []uint16, yMin uint32, yMax uint3
 				b += uint64(s[si+2]) * w
 				a += w
 			}
-			if a == 0 {
-				d[di+0] = 0
-				d[di+1] = 0
-				d[di+2] = 0
-				d[di+3] = 0
-			} else {
+			if a > 0 {
 				d[di+0] = uint16(r / a)
 				d[di+1] = uint16(g / a)
 				d[di+2] = uint16(b / a)
@@ -308,12 +313,7 @@ func vert16NRGBAInner(h *handle, s []uint16, d []uint16, xMin uint32, xMax uint3
 				b += uint64(s[si+2]) * w
 				a += w
 			}
-			if a == 0 {
-				d[di+0] = 0
-				d[di+1] = 0
-				d[di+2] = 0
-				d[di+3] = 0
-			} else {
+			if a > 0 {
 				d[di+0] = uint16(r / a)
 				d[di+1] = uint16(g / a)
 				d[di+2] = uint16(b / a)
