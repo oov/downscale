@@ -122,9 +122,9 @@ func RGBAGamma(ctx context.Context, dest *image.RGBA, src *image.RGBA, gamma flo
 					d[i+2] = t8[s[i+2]]
 				} else if a > 0 {
 					d[i+3] = uint16(a * 0x101)
-					d[i+0] = t8[uint32(s[i+0])*255/a]
-					d[i+1] = t8[uint32(s[i+1])*255/a]
-					d[i+2] = t8[uint32(s[i+2])*255/a]
+					d[i+0] = t8[divTable[(uint32(s[i+0])<<8)+a]]
+					d[i+1] = t8[divTable[(uint32(s[i+1])<<8)+a]]
+					d[i+2] = t8[divTable[(uint32(s[i+2])<<8)+a]]
 				}
 			}
 			if h.Aborted() {
