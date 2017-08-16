@@ -107,9 +107,9 @@ func horz8RGBAInner(h *handle, yMin uint32, yMax uint32, d []byte, s []byte, dlc
 				ta = uint32(s[si+3])
 				if ta > 0 {
 					w = ta * fl
-					r += divTable[(uint32(s[si+0])<<8)+ta] * w
-					g += divTable[(uint32(s[si+1])<<8)+ta] * w
-					b += divTable[(uint32(s[si+2])<<8)+ta] * w
+					r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+					g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+					b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
 					a += w
 				}
 				si += 4
@@ -118,9 +118,9 @@ func horz8RGBAInner(h *handle, yMin uint32, yMax uint32, d []byte, s []byte, dlc
 				ta = uint32(s[si+3])
 				if ta > 0 {
 					w = ta * slcmlen
-					r += divTable[(uint32(s[si+0])<<8)+ta] * w
-					g += divTable[(uint32(s[si+1])<<8)+ta] * w
-					b += divTable[(uint32(s[si+2])<<8)+ta] * w
+					r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+					g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+					b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
 					a += w
 				}
 				si += 4
@@ -128,9 +128,9 @@ func horz8RGBAInner(h *handle, yMin uint32, yMax uint32, d []byte, s []byte, dlc
 			if fr != 0 && s[si+3] > 0 {
 				ta = uint32(s[si+3])
 				w = ta * fr
-				r += divTable[(uint32(s[si+0])<<8)+ta] * w
-				g += divTable[(uint32(s[si+1])<<8)+ta] * w
-				b += divTable[(uint32(s[si+2])<<8)+ta] * w
+				r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+				g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+				b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
 				a += w
 			}
 			if a == 0 {
@@ -166,9 +166,9 @@ func vert8RGBAInner(h *handle, xMin uint32, xMax uint32, d []byte, s []byte, dlc
 				ta = uint32(s[si+3])
 				if ta > 0 {
 					w = ta * fl
-					r += divTable[(uint32(s[si+0])<<8)+ta] * w
-					g += divTable[(uint32(s[si+1])<<8)+ta] * w
-					b += divTable[(uint32(s[si+2])<<8)+ta] * w
+					r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+					g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+					b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
 					a += w
 				}
 				si += swx4
@@ -177,9 +177,9 @@ func vert8RGBAInner(h *handle, xMin uint32, xMax uint32, d []byte, s []byte, dlc
 				ta = uint32(s[si+3])
 				if ta > 0 {
 					w = ta * slcmlen
-					r += divTable[(uint32(s[si+0])<<8)+ta] * w
-					g += divTable[(uint32(s[si+1])<<8)+ta] * w
-					b += divTable[(uint32(s[si+2])<<8)+ta] * w
+					r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+					g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+					b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
 					a += w
 				}
 				si += swx4
@@ -187,9 +187,9 @@ func vert8RGBAInner(h *handle, xMin uint32, xMax uint32, d []byte, s []byte, dlc
 			if fr != 0 && s[si+3] > 0 {
 				ta = uint32(s[si+3])
 				w = ta * fr
-				r += divTable[(uint32(s[si+0])<<8)+ta] * w
-				g += divTable[(uint32(s[si+1])<<8)+ta] * w
-				b += divTable[(uint32(s[si+2])<<8)+ta] * w
+				r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+				g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+				b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
 				a += w
 			}
 			if a == 0 {
