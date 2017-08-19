@@ -32,3 +32,13 @@ func BenchmarkRGBAGamma(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkMakeTable(b *testing.B) {
+	testData := makeTableTestData[0]
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lcmlen := lcm(testData.sw, testData.dw)
+		slcmlen, dlcmlen := lcmlen/testData.sw, lcmlen/testData.dw
+		makeTable(testData.dw, dlcmlen, slcmlen)
+	}
+}

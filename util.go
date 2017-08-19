@@ -78,8 +78,9 @@ func lcm(a uint32, b uint32) uint32 {
 }
 
 func makeTable(l uint32, dlcmlen uint32, slcmlen uint32) ([]uint32, []uint32) {
-	tt := make([]uint32, l+1)
-	ft := make([]uint32, l+1)
+	buf := make([]uint32, l*2+2)
+	tt := buf[:l+1]
+	ft := buf[l+1:]
 	for i := uint32(0); i <= l; i++ {
 		ft[i] = (dlcmlen * (i + 1)) % slcmlen
 		tt[i] = (dlcmlen * i) / slcmlen
