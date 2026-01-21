@@ -88,6 +88,23 @@ func makeTable(l uint32, dlcmlen uint32, slcmlen uint32) ([]uint32, []uint32) {
 	return tt, ft
 }
 
+// GammaTable holds precomputed gamma correction lookup tables.
+// Create with NewGammaTable and reuse for multiple downscale operations
+// with the same gamma value to avoid repeated table generation.
+type GammaTable struct {
+	// T8 converts 8-bit sRGB values to 16-bit linear values
+	T8 [256]uint16
+	// T16 converts 16-bit linear values back to 8-bit sRGB values
+	T16 [65536]uint8
+}
+
+// NewGammaTable creates a new gamma correction table for the given gamma value.
+// Common values: 2.2 (sRGB approximation), 2.4 (sRGB standard)
+func NewGammaTable(gamma float64) *GammaTable {
+	t8, t16 := makeGammaTable(gamma)
+	return &GammaTable{T8: t8, T16: t16}
+}
+
 func makeGammaTable(g float64) ([256]uint16, [65536]uint8) {
 	var t [256]uint16
 	for i := range t {

@@ -7,11 +7,31 @@ import (
 	"errors"
 	"image"
 	"runtime"
+	"sync"
 )
 
+const (
+	// tileSize is the size of the tile for cache-friendly processing.
+	// 64x64 RGBA = 16KB fits in L1 cache.
+	tileSize = 64
+)
+
+var rgbaTilePool = sync.Pool{
+	New: func() any {
+		// Buffer for intermediate tile data: needs to hold source tile height * dest tile width
+		// Maximum: (tileSize * scale_ratio) * tileSize * 4 bytes
+		// For reasonable scale ratios (up to 4x), allocate 4 * tileSize^2 * 4 bytes
+		return make([]byte, tileSize*tileSize*4*4)
+	},
+}
+
+// RGBA performs cache-friendly tiled downscaling of RGBA images.
 func RGBA(ctx context.Context, dest *image.RGBA, src *image.RGBA) error {
 	sw, sh := src.Rect.Dx(), src.Rect.Dy()
 	dw, dh := dest.Rect.Dx(), dest.Rect.Dy()
+	if dw <= 0 || dh <= 0 {
+		return nil // Nothing to do for zero-size destination
+	}
 	if sw < dw || sh < dh {
 		return errors.New("upscale is not supported")
 	}
@@ -19,191 +39,266 @@ func RGBA(ctx context.Context, dest *image.RGBA, src *image.RGBA) error {
 		copy(dest.Pix, src.Pix)
 		return nil
 	}
+
 	var h handle
 	h.wg.Add(1)
 	go func() {
 		defer h.Done()
-		if sh != dh {
-			if sw != dw {
-				tmp := image.NewRGBA(image.Rect(0, 0, dw, sh))
-				horz8RGBA(ctx, tmp, src)
-				if h.Aborted() {
-					return
-				}
-				vert8RGBA(ctx, dest, tmp)
-			} else {
-				vert8RGBA(ctx, dest, src)
-			}
-		} else {
-			horz8RGBA(ctx, dest, src)
-		}
+		tiledRGBA(&h, dest, src)
 	}()
 	return h.Wait(ctx)
 }
 
-func horz8RGBA(ctx context.Context, dest *image.RGBA, src *image.RGBA) error {
+// tiledRGBA processes the image in tiles for better cache locality.
+func tiledRGBA(parentHandle *handle, dest *image.RGBA, src *image.RGBA) {
+	sw, sh := uint32(src.Rect.Dx()), uint32(src.Rect.Dy())
+	dw, dh := uint32(dest.Rect.Dx()), uint32(dest.Rect.Dy())
+
+	// Calculate LCM-based parameters for horizontal scaling
+	hLcmLen := lcm(sw, dw)
+	hSLcmLen, hDLcmLen := hLcmLen/sw, hLcmLen/dw
+	hTT, hFT := makeTable(dw, hDLcmLen, hSLcmLen)
+
+	// Calculate LCM-based parameters for vertical scaling
+	vLcmLen := lcm(sh, dh)
+	vSLcmLen, vDLcmLen := vLcmLen/sh, vLcmLen/dh
+	vTT, vFT := makeTable(dh, vDLcmLen, vSLcmLen)
+
+	// Determine number of workers based on number of tiles
+	numTilesX := int((dw + tileSize - 1) / tileSize)
+	numTilesY := int((dh + tileSize - 1) / tileSize)
+	totalTiles := numTilesX * numTilesY
+
 	n := runtime.GOMAXPROCS(0)
-	for n > 1 && n<<1 > dest.Rect.Dy() {
-		n--
+	if n > totalTiles {
+		n = totalTiles
 	}
 
-	sw, dw := uint32(src.Rect.Dx()), uint32(dest.Rect.Dx())
-	lcmlen := lcm(sw, dw)
-	slcmlen, dlcmlen := lcmlen/sw, lcmlen/dw
-	tt, ft := makeTable(dw, dlcmlen, slcmlen)
-	dh := uint32(dest.Rect.Dy())
+	var wg sync.WaitGroup
+	tileChan := make(chan [2]uint32, totalTiles)
 
-	var h handle
-	h.wg.Add(n)
-	step := dh / uint32(n)
-	y := uint32(0)
-	for i := 1; i < n; i++ {
-		go horz8RGBAInner(&h, y, y+step, dest.Pix, src.Pix, dlcmlen, slcmlen, dw, sw, tt, ft)
-		y += step
+	// Enqueue all tiles
+	for ty := uint32(0); ty < dh; ty += tileSize {
+		for tx := uint32(0); tx < dw; tx += tileSize {
+			tileChan <- [2]uint32{tx, ty}
+		}
 	}
-	go horz8RGBAInner(&h, y, dh, dest.Pix, src.Pix, dlcmlen, slcmlen, dw, sw, tt, ft)
-	return h.Wait(ctx)
+	close(tileChan)
+
+	// Start workers
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			processTilesRGBA(parentHandle, tileChan, dest, src, hTT, hFT, vTT, vFT,
+				hSLcmLen, hDLcmLen, vSLcmLen, vDLcmLen, sw, dw, sh, dh)
+		}()
+	}
+
+	// Wait for workers - parent's h.Wait(ctx) handles context cancellation
+	// and will call SetAbort(), which workers check via parentHandle.Aborted()
+	wg.Wait()
 }
 
-func vert8RGBA(ctx context.Context, dest *image.RGBA, src *image.RGBA) error {
-	n := runtime.GOMAXPROCS(0)
-	for n > 1 && n<<1 > dest.Rect.Dx() {
-		n--
-	}
+func processTilesRGBA(h *handle, tileChan <-chan [2]uint32,
+	dest *image.RGBA, src *image.RGBA,
+	hTT, hFT, vTT, vFT []uint32,
+	hSLcmLen, hDLcmLen, vSLcmLen, vDLcmLen uint32,
+	sw, dw, sh, dh uint32) {
 
-	sw, dw := uint32(src.Rect.Dx()), uint32(dest.Rect.Dx())
-	sh, dh := uint32(src.Rect.Dy()), uint32(dest.Rect.Dy())
-	lcmlen := lcm(sh, dh)
-	slcmlen, dlcmlen := lcmlen/sh, lcmlen/dh
-	tt, ft := makeTable(dh, dlcmlen, slcmlen)
+	// Get a buffer from the pool for intermediate horizontal results
+	buf := rgbaTilePool.Get().([]byte)
+	defer rgbaTilePool.Put(buf)
 
-	h := &handle{}
-	h.wg.Add(n)
-	step := (dw / uint32(n)) << 2
-	x := uint32(0)
-	for i := 1; i < n; i++ {
-		go vert8RGBAInner(h, x, x+step, dest.Pix, src.Pix, dlcmlen, slcmlen, dw, dh, sw, tt, ft)
-		x += step
-	}
-	go vert8RGBAInner(h, x, dw<<2, dest.Pix, src.Pix, dlcmlen, slcmlen, dw, dh, sw, tt, ft)
-	return h.Wait(ctx)
-}
+	swx4 := sw << 2
+	dwx4 := dw << 2
 
-func horz8RGBAInner(h *handle, yMin uint32, yMax uint32, d []byte, s []byte, dlcmlen uint32, slcmlen uint32, dw uint32, sw uint32, tt []uint32, ft []uint32) {
-	defer h.Done()
-	swx4, dwx4 := sw<<2, dw<<2
-	for y := yMin; y < yMax; y++ {
-		if y&7 == 7 && h.Aborted() {
+	for tile := range tileChan {
+		if h.Aborted() {
 			return
 		}
-		di := y * dwx4
-		si := y * swx4
-		for x, fr := uint32(0), uint32(0); x < dw; x++ {
-			tl, tr := tt[x], tt[x+1]
-			fl := slcmlen - fr
-			fr = ft[x]
-			var ta, a, r, g, b, w uint32
-			if fl != 0 {
-				ta = uint32(s[si+3])
-				if ta > 0 {
-					w = ta * fl
-					r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
-					g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
-					b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
-					a += w
-				}
-				si += 4
-			}
-			for i := tl + 1; i < tr; i++ {
-				ta = uint32(s[si+3])
-				if ta > 0 {
-					w = ta * slcmlen
-					r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
-					g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
-					b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
-					a += w
-				}
-				si += 4
-			}
-			if fr != 0 && s[si+3] > 0 {
-				ta = uint32(s[si+3])
-				w = ta * fr
+
+		dxStart, dyStart := tile[0], tile[1]
+		dxEnd := dxStart + tileSize
+		dyEnd := dyStart + tileSize
+		if dxEnd > dw {
+			dxEnd = dw
+		}
+		if dyEnd > dh {
+			dyEnd = dh
+		}
+		tileW := dxEnd - dxStart
+
+		// Calculate corresponding source Y range for this tile
+		syStart := vTT[dyStart]
+		syEnd := vTT[dyEnd]
+		if dyEnd < dh && vFT[dyEnd-1] > 0 {
+			syEnd++
+		}
+		if syEnd > sh {
+			syEnd = sh
+		}
+		srcTileH := syEnd - syStart
+
+		// Calculate intermediate buffer size: srcTileH rows * tileW pixels * 4 bytes
+		intermediateStride := tileW << 2
+		intermediateSize := srcTileH * intermediateStride
+		var intermediate []byte
+		if int(intermediateSize) <= len(buf) {
+			intermediate = buf[:intermediateSize]
+		} else {
+			intermediate = make([]byte, intermediateSize)
+		}
+
+		// Step 1: Horizontal scaling for source rows [syStart, syEnd)
+		// Output to intermediate buffer with width = tileW
+		for sy := syStart; sy < syEnd; sy++ {
+			srcRow := src.Pix[sy*swx4:]
+			dstRow := intermediate[(sy-syStart)*intermediateStride:]
+			horzRowRGBATile(dstRow, srcRow, dxStart, dxEnd, hTT, hFT, hSLcmLen, hDLcmLen)
+		}
+
+		// Step 2: Vertical scaling from intermediate to destination
+		// Process each column in the tile
+		for dx := dxStart; dx < dxEnd; dx++ {
+			vertColRGBATile(dest.Pix, intermediate,
+				dx, dyStart, dyEnd,
+				dx-dxStart, syStart,
+				vTT, vFT, vSLcmLen, vDLcmLen,
+				dwx4, intermediateStride)
+		}
+	}
+}
+
+// horzRowRGBATile performs horizontal scaling for a portion of a row [dxStart, dxEnd).
+func horzRowRGBATile(d []byte, s []byte, dxStart, dxEnd uint32, tt, ft []uint32, slcmlen, dlcmlen uint32) {
+	di := uint32(0)
+
+	// Initialize fr correctly for starting at dxStart
+	fr := uint32(0)
+	if dxStart > 0 {
+		fr = ft[dxStart-1]
+	}
+
+	for dx := dxStart; dx < dxEnd; dx++ {
+		tl, tr := tt[dx], tt[dx+1]
+		fl := slcmlen - fr
+		fr = ft[dx]
+
+		var ta, a, r, g, b, w uint32
+		si := tl << 2
+
+		if fl != 0 {
+			ta = uint32(s[si+3])
+			if ta > 0 {
+				w = ta * fl
 				r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
 				g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
 				b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
 				a += w
 			}
-			if a == 0 {
-				d[di+0] = 0
-				d[di+1] = 0
-				d[di+2] = 0
-				d[di+3] = 0
-			} else {
-				d[di+0] = uint8((r / dlcmlen * 32897) >> 23)
-				d[di+1] = uint8((g / dlcmlen * 32897) >> 23)
-				d[di+2] = uint8((b / dlcmlen * 32897) >> 23)
-				d[di+3] = uint8(a / dlcmlen)
-			}
-			di += 4
+			si += 4
 		}
-	}
-}
-
-func vert8RGBAInner(h *handle, xMin uint32, xMax uint32, d []byte, s []byte, dlcmlen uint32, slcmlen uint32, dw uint32, dh uint32, sw uint32, tt []uint32, ft []uint32) {
-	defer h.Done()
-	swx4, dwx4 := sw<<2, dw<<2
-	for x := xMin; x < xMax; x += 4 {
-		if (x>>2)&7 == 7 && h.Aborted() {
-			return
-		}
-		di, si := x, x
-		for y, fr := uint32(0), uint32(0); y < dh; y++ {
-			tl, tr := tt[y], tt[y+1]
-			fl := slcmlen - fr
-			fr = ft[y]
-			var ta, a, r, g, b, w uint32
-			if fl != 0 {
-				ta = uint32(s[si+3])
-				if ta > 0 {
-					w = ta * fl
-					r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
-					g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
-					b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
-					a += w
-				}
-				si += swx4
-			}
-			for i := tl + 1; i < tr; i++ {
-				ta = uint32(s[si+3])
-				if ta > 0 {
-					w = ta * slcmlen
-					r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
-					g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
-					b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
-					a += w
-				}
-				si += swx4
-			}
-			if fr != 0 && s[si+3] > 0 {
-				ta = uint32(s[si+3])
-				w = ta * fr
+		for i := tl + 1; i < tr; i++ {
+			ta = uint32(s[si+3])
+			if ta > 0 {
+				w = ta * slcmlen
 				r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
 				g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
 				b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
 				a += w
 			}
-			if a == 0 {
-				d[di+0] = 0
-				d[di+1] = 0
-				d[di+2] = 0
-				d[di+3] = 0
-			} else {
-				d[di+0] = uint8((r / dlcmlen * 32897) >> 23)
-				d[di+1] = uint8((g / dlcmlen * 32897) >> 23)
-				d[di+2] = uint8((b / dlcmlen * 32897) >> 23)
-				d[di+3] = uint8(a / dlcmlen)
-			}
-			di += dwx4
+			si += 4
 		}
+		if fr != 0 && s[si+3] > 0 {
+			ta = uint32(s[si+3])
+			w = ta * fr
+			r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+			g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+			b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
+			a += w
+		}
+
+		if a == 0 {
+			d[di+0] = 0
+			d[di+1] = 0
+			d[di+2] = 0
+			d[di+3] = 0
+		} else {
+			d[di+0] = uint8((r / dlcmlen * 32897) >> 23)
+			d[di+1] = uint8((g / dlcmlen * 32897) >> 23)
+			d[di+2] = uint8((b / dlcmlen * 32897) >> 23)
+			d[di+3] = uint8(a / dlcmlen)
+		}
+		di += 4
+	}
+}
+
+// vertColRGBATile performs vertical scaling for a single column in a tile.
+func vertColRGBATile(d []byte, s []byte,
+	dx, dyStart, dyEnd uint32,
+	sx, syStart uint32,
+	tt, ft []uint32, slcmlen, dlcmlen uint32,
+	dStride, sStride uint32) {
+
+	di := dyStart*dStride + (dx << 2)
+
+	// Initialize fr correctly for starting at dyStart
+	fr := uint32(0)
+	if dyStart > 0 {
+		fr = ft[dyStart-1]
+	}
+
+	for dy := dyStart; dy < dyEnd; dy++ {
+		tl, tr := tt[dy], tt[dy+1]
+		fl := slcmlen - fr
+		fr = ft[dy]
+
+		var ta, a, r, g, b, w uint32
+		si := (tl - syStart) * sStride + (sx << 2)
+
+		if fl != 0 {
+			ta = uint32(s[si+3])
+			if ta > 0 {
+				w = ta * fl
+				r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+				g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+				b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
+				a += w
+			}
+			si += sStride
+		}
+		for i := tl + 1; i < tr; i++ {
+			ta = uint32(s[si+3])
+			if ta > 0 {
+				w = ta * slcmlen
+				r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+				g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+				b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
+				a += w
+			}
+			si += sStride
+		}
+		if fr != 0 && s[si+3] > 0 {
+			ta = uint32(s[si+3])
+			w = ta * fr
+			r += uint32(divTable[(uint32(s[si+0])<<8)+ta]) * w
+			g += uint32(divTable[(uint32(s[si+1])<<8)+ta]) * w
+			b += uint32(divTable[(uint32(s[si+2])<<8)+ta]) * w
+			a += w
+		}
+
+		if a == 0 {
+			d[di+0] = 0
+			d[di+1] = 0
+			d[di+2] = 0
+			d[di+3] = 0
+		} else {
+			d[di+0] = uint8((r / dlcmlen * 32897) >> 23)
+			d[di+1] = uint8((g / dlcmlen * 32897) >> 23)
+			d[di+2] = uint8((b / dlcmlen * 32897) >> 23)
+			d[di+3] = uint8(a / dlcmlen)
+		}
+		di += dStride
 	}
 }
