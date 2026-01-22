@@ -302,3 +302,140 @@ func vertColRGBATile(d []byte, s []byte,
 		di += dStride
 	}
 }
+
+// RGBAPartial performs partial downscaling of RGBA images, only processing
+// tiles that correspond to dirty source tiles.
+// srcTileSize and dstTileSize specify the tile sizes used for dirty tile tracking.
+// srcDirtyTiles contains the top-left coordinates of dirty tiles in source coordinates.
+func RGBAPartial(ctx context.Context, dest *image.RGBA, src *image.RGBA, srcTileSize, dstTileSize int, srcDirtyTiles []image.Point) error {
+	sw, sh := src.Rect.Dx(), src.Rect.Dy()
+	dw, dh := dest.Rect.Dx(), dest.Rect.Dy()
+	if dw <= 0 || dh <= 0 {
+		return nil
+	}
+	if sw < dw || sh < dh {
+		return errors.New("upscale is not supported")
+	}
+	if len(srcDirtyTiles) == 0 {
+		return nil // Nothing changed
+	}
+
+	// Calculate which destination tiles need updating
+	dstDirtyTiles := calcDstDirtyTiles(sw, sh, dw, dh, srcTileSize, dstTileSize, srcDirtyTiles)
+	if len(dstDirtyTiles) == 0 {
+		return nil
+	}
+
+	var h handle
+	h.wg.Add(1)
+	go func() {
+		defer h.Done()
+		tiledRGBAPartial(&h, dest, src, uint32(dstTileSize), dstDirtyTiles)
+	}()
+	return h.Wait(ctx)
+}
+
+func tiledRGBAPartial(parentHandle *handle, dest *image.RGBA, src *image.RGBA, ts uint32, dstDirtyTiles [][2]uint32) {
+	sw, sh := uint32(src.Rect.Dx()), uint32(src.Rect.Dy())
+	dw, dh := uint32(dest.Rect.Dx()), uint32(dest.Rect.Dy())
+
+	hLcmLen := lcm(sw, dw)
+	hSLcmLen, hDLcmLen := hLcmLen/sw, hLcmLen/dw
+	hTT, hFT := makeTable(dw, hDLcmLen, hSLcmLen)
+
+	vLcmLen := lcm(sh, dh)
+	vSLcmLen, vDLcmLen := vLcmLen/sh, vLcmLen/dh
+	vTT, vFT := makeTable(dh, vDLcmLen, vSLcmLen)
+
+	totalTiles := len(dstDirtyTiles)
+	n := runtime.GOMAXPROCS(0)
+	if n > totalTiles {
+		n = totalTiles
+	}
+
+	var wg sync.WaitGroup
+	tileChan := make(chan [2]uint32, totalTiles)
+
+	for _, tile := range dstDirtyTiles {
+		tileChan <- tile
+	}
+	close(tileChan)
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			processTilesRGBAWithTileSize(parentHandle, tileChan, dest, src, hTT, hFT, vTT, vFT,
+				hSLcmLen, hDLcmLen, vSLcmLen, vDLcmLen, sw, dw, sh, dh, ts)
+		}()
+	}
+
+	wg.Wait()
+}
+
+func processTilesRGBAWithTileSize(h *handle, tileChan <-chan [2]uint32,
+	dest *image.RGBA, src *image.RGBA,
+	hTT, hFT, vTT, vFT []uint32,
+	hSLcmLen, hDLcmLen, vSLcmLen, vDLcmLen uint32,
+	sw, dw, sh, dh, ts uint32) {
+
+	// Allocate buffer based on tile size
+	bufSize := ts * ts * 4 * 4
+	buf := make([]byte, bufSize)
+
+	swx4 := sw << 2
+	dwx4 := dw << 2
+
+	for tile := range tileChan {
+		if h.Aborted() {
+			return
+		}
+
+		dxStart, dyStart := tile[0], tile[1]
+		dxEnd := dxStart + ts
+		dyEnd := dyStart + ts
+		if dxEnd > dw {
+			dxEnd = dw
+		}
+		if dyEnd > dh {
+			dyEnd = dh
+		}
+		tileW := dxEnd - dxStart
+
+		syStart := vTT[dyStart]
+		syEnd := vTT[dyEnd]
+		if dyEnd < dh && vFT[dyEnd-1] > 0 {
+			syEnd++
+		}
+		if syEnd > sh {
+			syEnd = sh
+		}
+		srcTileH := syEnd - syStart
+
+		intermediateStride := tileW << 2
+		intermediateSize := srcTileH * intermediateStride
+		var intermediate []byte
+		if int(intermediateSize) <= len(buf) {
+			intermediate = buf[:intermediateSize]
+		} else {
+			intermediate = make([]byte, intermediateSize)
+		}
+
+		for sy := syStart; sy < syEnd; sy++ {
+			srcRow := src.Pix[sy*swx4:]
+			dstRow := intermediate[(sy-syStart)*intermediateStride:]
+			horzRowRGBATile(dstRow, srcRow, dxStart, dxEnd, hTT, hFT, hSLcmLen, hDLcmLen)
+		}
+
+		for dx := dxStart; dx < dxEnd; dx++ {
+			vertColRGBATile(dest.Pix, intermediate,
+				dx, dyStart, dyEnd,
+				dx-dxStart, syStart,
+				vTT, vFT, vSLcmLen, vDLcmLen,
+				dwx4, intermediateStride)
+		}
+	}
+
+	// Suppress unused variable warnings
+	_ = swx4
+}

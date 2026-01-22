@@ -404,3 +404,557 @@ func vertCol16NRGBATile(d []uint16, s []uint16,
 		di += dStride
 	}
 }
+
+// NRGBAGammaPartial performs partial gamma-corrected downscaling on dirty tiles only.
+// srcDirtyTiles are tile coordinates in source image space.
+// Linear conversion, downscaling, and gamma conversion are all done per-tile.
+func NRGBAGammaPartial(ctx context.Context, dest *image.NRGBA, src *image.NRGBA, gamma float64, srcTileSize, dstTileSize int, srcDirtyTiles []image.Point) error {
+	return NRGBAGammaPartialWithTable(ctx, dest, src, NewGammaTable(gamma), srcTileSize, dstTileSize, srcDirtyTiles)
+}
+
+// NRGBAGammaPartialWithTable performs partial gamma-corrected downscaling using a precomputed gamma table.
+func NRGBAGammaPartialWithTable(ctx context.Context, dest *image.NRGBA, src *image.NRGBA, table *GammaTable, srcTileSize, dstTileSize int, srcDirtyTiles []image.Point) error {
+	sw, sh := src.Rect.Dx(), src.Rect.Dy()
+	dw, dh := dest.Rect.Dx(), dest.Rect.Dy()
+	if dw <= 0 || dh <= 0 {
+		return nil
+	}
+	if sw < dw || sh < dh {
+		return errors.New("upscale is not supported")
+	}
+	if len(srcDirtyTiles) == 0 {
+		return nil // Nothing changed
+	}
+
+	// Calculate which destination tiles need updating
+	dstDirtyTiles := calcDstDirtyTiles(sw, sh, dw, dh, srcTileSize, dstTileSize, srcDirtyTiles)
+	if len(dstDirtyTiles) == 0 {
+		return nil
+	}
+
+	var h handle
+	h.wg.Add(1)
+	go func() {
+		defer h.Done()
+		tiled16NRGBAGammaPartial(&h, dest, src, table, uint32(dstTileSize), dstDirtyTiles)
+	}()
+	return h.Wait(ctx)
+}
+
+func tiled16NRGBAGammaPartial(parentHandle *handle, dest *image.NRGBA, src *image.NRGBA, table *GammaTable, ts uint32, dstDirtyTiles [][2]uint32) {
+	sw, sh := uint32(src.Rect.Dx()), uint32(src.Rect.Dy())
+	dw, dh := uint32(dest.Rect.Dx()), uint32(dest.Rect.Dy())
+
+	hLcmLen := lcm(sw, dw)
+	hSLcmLen, hDLcmLen := hLcmLen/sw, hLcmLen/dw
+	hTT, hFT := makeTable(dw, hDLcmLen, hSLcmLen)
+
+	vLcmLen := lcm(sh, dh)
+	vSLcmLen, vDLcmLen := vLcmLen/sh, vLcmLen/dh
+	vTT, vFT := makeTable(dh, vDLcmLen, vSLcmLen)
+
+	totalTiles := len(dstDirtyTiles)
+	n := runtime.GOMAXPROCS(0)
+	if n > totalTiles {
+		n = totalTiles
+	}
+
+	var wg sync.WaitGroup
+	tileChan := make(chan [2]uint32, totalTiles)
+
+	for _, tile := range dstDirtyTiles {
+		tileChan <- tile
+	}
+	close(tileChan)
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			processTiles16NRGBAGammaPartial(parentHandle, tileChan, dest, src, table, hTT, hFT, vTT, vFT,
+				uint64(hSLcmLen), uint64(hDLcmLen), uint64(vSLcmLen), uint64(vDLcmLen), sw, dw, sh, dh, ts)
+		}()
+	}
+
+	wg.Wait()
+}
+
+func processTiles16NRGBAGammaPartial(h *handle, tileChan <-chan [2]uint32,
+	dest *image.NRGBA, src *image.NRGBA, table *GammaTable,
+	hTT, hFT, vTT, vFT []uint32,
+	hSLcmLen, hDLcmLen, vSLcmLen, vDLcmLen uint64,
+	sw, dw, sh, dh, ts uint32) {
+
+	t8, t16 := table.T8, table.T16
+	swx4 := sw << 2
+	dwx4 := dw << 2
+
+	// Allocate buffers for linear space processing
+	// Size is based on maximum source tile height * dest tile width
+	maxSrcTileH := ts * 4 // Conservative estimate for source tile height ratio
+	srcLinearBuf := make([]uint16, maxSrcTileH*ts*4)
+	intermediateBuf := make([]uint16, maxSrcTileH*ts*4)
+
+	for tile := range tileChan {
+		if h.Aborted() {
+			return
+		}
+
+		dxStart, dyStart := tile[0], tile[1]
+		dxEnd := dxStart + ts
+		dyEnd := dyStart + ts
+		if dxEnd > dw {
+			dxEnd = dw
+		}
+		if dyEnd > dh {
+			dyEnd = dh
+		}
+		tileW := dxEnd - dxStart
+		tileH := dyEnd - dyStart
+
+		// Find source pixel range for this destination tile
+		sxStart := hTT[dxStart]
+		sxEnd := hTT[dxEnd]
+		if dxEnd < dw && hFT[dxEnd-1] > 0 {
+			sxEnd++
+		}
+		if sxEnd > sw {
+			sxEnd = sw
+		}
+
+		syStart := vTT[dyStart]
+		syEnd := vTT[dyEnd]
+		if dyEnd < dh && vFT[dyEnd-1] > 0 {
+			syEnd++
+		}
+		if syEnd > sh {
+			syEnd = sh
+		}
+		srcTileH := syEnd - syStart
+		srcTileW := sxEnd - sxStart
+
+		// Ensure buffer is large enough
+		srcLinearSize := srcTileH * srcTileW * 4
+		if int(srcLinearSize) > len(srcLinearBuf) {
+			srcLinearBuf = make([]uint16, srcLinearSize)
+		}
+		srcLinear := srcLinearBuf[:srcLinearSize]
+
+		// Convert source tile to linear space
+		srcLinearStride := srcTileW << 2
+		for sy := syStart; sy < syEnd; sy++ {
+			srcRowOff := sy * swx4
+			dstRowOff := (sy - syStart) * srcLinearStride
+			for sx := sxStart; sx < sxEnd; sx++ {
+				si := srcRowOff + (sx << 2)
+				di := dstRowOff + ((sx - sxStart) << 2)
+				srcLinear[di+3] = uint16(src.Pix[si+3]) * 0x101
+				srcLinear[di+0] = t8[src.Pix[si+0]]
+				srcLinear[di+1] = t8[src.Pix[si+1]]
+				srcLinear[di+2] = t8[src.Pix[si+2]]
+			}
+		}
+
+		// Downscale tile (horizontal pass)
+		intermediateStride := tileW << 2
+		intermediateSize := srcTileH * intermediateStride
+		if int(intermediateSize) > len(intermediateBuf) {
+			intermediateBuf = make([]uint16, intermediateSize)
+		}
+		intermediate := intermediateBuf[:intermediateSize]
+
+		for sy := syStart; sy < syEnd; sy++ {
+			// Create row view of linear source
+			srcRow := srcLinear[(sy-syStart)*srcLinearStride:]
+			dstRow := intermediate[(sy-syStart)*intermediateStride:]
+			horzRow16NRGBATileOffset(dstRow, srcRow, dxStart, dxEnd, sxStart, hTT, hFT, hSLcmLen, hDLcmLen)
+		}
+
+		// Downscale tile (vertical pass) and convert back to gamma space
+		for dx := dxStart; dx < dxEnd; dx++ {
+			vertCol16NRGBATileToGamma(dest.Pix, intermediate, t16,
+				dx, dyStart, dyEnd,
+				dx-dxStart, syStart,
+				vTT, vFT, vSLcmLen, vDLcmLen,
+				dwx4, intermediateStride)
+		}
+
+		_ = tileH // suppress unused warning
+	}
+}
+
+// horzRow16NRGBATileOffset is like horzRow16NRGBATile but with source offset
+func horzRow16NRGBATileOffset(d []uint16, s []uint16, dxStart, dxEnd, sxOffset uint32, tt, ft []uint32, slcmlen, dlcmlen uint64) {
+	di := uint32(0)
+
+	fr := uint64(0)
+	if dxStart > 0 {
+		fr = uint64(ft[dxStart-1])
+	}
+
+	for dx := dxStart; dx < dxEnd; dx++ {
+		tl, tr := tt[dx], tt[dx+1]
+		fl := slcmlen - fr
+		fr = uint64(ft[dx])
+
+		var a, r, g, b, w uint64
+		si := (tl - sxOffset) << 2
+
+		if fl != 0 {
+			w = uint64(s[si+3]) * fl
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+			si += 4
+		}
+		for i := tl + 1; i < tr; i++ {
+			w = uint64(s[si+3]) * slcmlen
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+			si += 4
+		}
+		if fr != 0 {
+			w = uint64(s[si+3]) * fr
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+		}
+
+		if a > 0 {
+			d[di+0] = uint16(r / a)
+			d[di+1] = uint16(g / a)
+			d[di+2] = uint16(b / a)
+			d[di+3] = uint16(a / dlcmlen)
+		} else {
+			d[di+0] = 0
+			d[di+1] = 0
+			d[di+2] = 0
+			d[di+3] = 0
+		}
+		di += 4
+	}
+}
+
+// vertCol16NRGBATileToGamma combines vertical downscaling with gamma conversion
+func vertCol16NRGBATileToGamma(d []byte, s []uint16, t16 [65536]uint8,
+	dx, dyStart, dyEnd uint32,
+	sx, syStart uint32,
+	tt, ft []uint32, slcmlen, dlcmlen uint64,
+	dStride, sStride uint32) {
+
+	di := dyStart*dStride + (dx << 2)
+
+	fr := uint64(0)
+	if dyStart > 0 {
+		fr = uint64(ft[dyStart-1])
+	}
+
+	for dy := dyStart; dy < dyEnd; dy++ {
+		tl, tr := tt[dy], tt[dy+1]
+		fl := slcmlen - fr
+		fr = uint64(ft[dy])
+
+		var a, r, g, b, w uint64
+		si := (tl - syStart) * sStride + (sx << 2)
+
+		if fl != 0 {
+			w = uint64(s[si+3]) * fl
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+			si += sStride
+		}
+		for i := tl + 1; i < tr; i++ {
+			w = uint64(s[si+3]) * slcmlen
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+			si += sStride
+		}
+		if fr != 0 {
+			w = uint64(s[si+3]) * fr
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+		}
+
+		if a > 0 {
+			d[di+3] = uint8(a / dlcmlen >> 8)
+			d[di+0] = t16[r/a]
+			d[di+1] = t16[g/a]
+			d[di+2] = t16[b/a]
+		} else {
+			d[di+0] = 0
+			d[di+1] = 0
+			d[di+2] = 0
+			d[di+3] = 0
+		}
+		di += dStride
+	}
+}
+
+// RGBAGammaPartial performs partial gamma-corrected downscaling of RGBA images.
+// Only the destination tiles corresponding to the dirty source tiles are updated.
+func RGBAGammaPartial(ctx context.Context, dest *image.RGBA, src *image.RGBA, gamma float64, srcTileSize, dstTileSize int, srcDirtyTiles []image.Point) error {
+	return RGBAGammaPartialWithTable(ctx, dest, src, NewGammaTable(gamma), srcTileSize, dstTileSize, srcDirtyTiles)
+}
+
+// RGBAGammaPartialWithTable performs partial gamma-corrected downscaling using a precomputed gamma table.
+func RGBAGammaPartialWithTable(ctx context.Context, dest *image.RGBA, src *image.RGBA, table *GammaTable, srcTileSize, dstTileSize int, srcDirtyTiles []image.Point) error {
+	sw, sh := src.Rect.Dx(), src.Rect.Dy()
+	dw, dh := dest.Rect.Dx(), dest.Rect.Dy()
+	if dw <= 0 || dh <= 0 {
+		return nil
+	}
+	if sw < dw || sh < dh {
+		return errors.New("upscale is not supported")
+	}
+	if len(srcDirtyTiles) == 0 {
+		return nil
+	}
+
+	dstDirtyTiles := calcDstDirtyTiles(sw, sh, dw, dh, srcTileSize, dstTileSize, srcDirtyTiles)
+	if len(dstDirtyTiles) == 0 {
+		return nil
+	}
+
+	var h handle
+	h.wg.Add(1)
+	go func() {
+		defer h.Done()
+		tiled16RGBAGammaPartial(&h, dest, src, table, uint32(dstTileSize), dstDirtyTiles)
+	}()
+	return h.Wait(ctx)
+}
+
+func tiled16RGBAGammaPartial(parentHandle *handle, dest *image.RGBA, src *image.RGBA, table *GammaTable, ts uint32, dstDirtyTiles [][2]uint32) {
+	sw, sh := uint32(src.Rect.Dx()), uint32(src.Rect.Dy())
+	dw, dh := uint32(dest.Rect.Dx()), uint32(dest.Rect.Dy())
+
+	hLcmLen := lcm(sw, dw)
+	hSLcmLen, hDLcmLen := hLcmLen/sw, hLcmLen/dw
+	hTT, hFT := makeTable(dw, hDLcmLen, hSLcmLen)
+
+	vLcmLen := lcm(sh, dh)
+	vSLcmLen, vDLcmLen := vLcmLen/sh, vLcmLen/dh
+	vTT, vFT := makeTable(dh, vDLcmLen, vSLcmLen)
+
+	totalTiles := len(dstDirtyTiles)
+	n := runtime.GOMAXPROCS(0)
+	if n > totalTiles {
+		n = totalTiles
+	}
+
+	var wg sync.WaitGroup
+	tileChan := make(chan [2]uint32, totalTiles)
+	for _, tile := range dstDirtyTiles {
+		tileChan <- tile
+	}
+	close(tileChan)
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			processTiles16RGBAGammaPartial(parentHandle, tileChan,
+				dest, src, table,
+				hTT, hFT, vTT, vFT,
+				uint64(hSLcmLen), uint64(hDLcmLen), uint64(vSLcmLen), uint64(vDLcmLen),
+				sw, dw, sh, dh, ts)
+		}()
+	}
+	wg.Wait()
+}
+
+func processTiles16RGBAGammaPartial(h *handle, tileChan <-chan [2]uint32,
+	dest *image.RGBA, src *image.RGBA, table *GammaTable,
+	hTT, hFT, vTT, vFT []uint32,
+	hSLcmLen, hDLcmLen, vSLcmLen, vDLcmLen uint64,
+	sw, dw, sh, dh, ts uint32) {
+
+	t8, t16 := table.T8, table.T16
+	swx4 := sw << 2
+	dwx4 := dw << 2
+
+	srcLinearBuf := make([]uint16, ts*ts*4*4)
+	intermediateBuf := make([]uint16, ts*ts*4*4)
+
+	for tile := range tileChan {
+		if h.Aborted() {
+			return
+		}
+
+		dxStart, dyStart := tile[0], tile[1]
+		dxEnd := dxStart + ts
+		dyEnd := dyStart + ts
+		if dxEnd > dw {
+			dxEnd = dw
+		}
+		if dyEnd > dh {
+			dyEnd = dh
+		}
+		tileW := dxEnd - dxStart
+		tileH := dyEnd - dyStart
+
+		sxStart := hTT[dxStart]
+		sxEnd := hTT[dxEnd]
+		if dxEnd < dw && hFT[dxEnd-1] > 0 {
+			sxEnd++
+		}
+		if sxEnd > sw {
+			sxEnd = sw
+		}
+
+		syStart := vTT[dyStart]
+		syEnd := vTT[dyEnd]
+		if dyEnd < dh && vFT[dyEnd-1] > 0 {
+			syEnd++
+		}
+		if syEnd > sh {
+			syEnd = sh
+		}
+		srcTileH := syEnd - syStart
+		srcTileW := sxEnd - sxStart
+
+		srcLinearSize := srcTileH * srcTileW * 4
+		if int(srcLinearSize) > len(srcLinearBuf) {
+			srcLinearBuf = make([]uint16, srcLinearSize)
+		}
+		srcLinear := srcLinearBuf[:srcLinearSize]
+
+		// Convert source tile to linear space (unpremultiply for RGBA)
+		srcLinearStride := srcTileW << 2
+		for sy := syStart; sy < syEnd; sy++ {
+			srcRowOff := sy * swx4
+			dstRowOff := (sy - syStart) * srcLinearStride
+			for sx := sxStart; sx < sxEnd; sx++ {
+				si := srcRowOff + (sx << 2)
+				di := dstRowOff + ((sx - sxStart) << 2)
+				a := uint32(src.Pix[si+3])
+				if a == 255 {
+					srcLinear[di+3] = 65535
+					srcLinear[di+0] = t8[src.Pix[si+0]]
+					srcLinear[di+1] = t8[src.Pix[si+1]]
+					srcLinear[di+2] = t8[src.Pix[si+2]]
+				} else if a > 0 {
+					srcLinear[di+3] = uint16(a * 0x101)
+					srcLinear[di+0] = t8[divTable[(uint32(src.Pix[si+0])<<8)+a]]
+					srcLinear[di+1] = t8[divTable[(uint32(src.Pix[si+1])<<8)+a]]
+					srcLinear[di+2] = t8[divTable[(uint32(src.Pix[si+2])<<8)+a]]
+				} else {
+					srcLinear[di+0] = 0
+					srcLinear[di+1] = 0
+					srcLinear[di+2] = 0
+					srcLinear[di+3] = 0
+				}
+			}
+		}
+
+		// Downscale tile (horizontal pass)
+		intermediateStride := tileW << 2
+		intermediateSize := srcTileH * intermediateStride
+		if int(intermediateSize) > len(intermediateBuf) {
+			intermediateBuf = make([]uint16, intermediateSize)
+		}
+		intermediate := intermediateBuf[:intermediateSize]
+
+		for sy := syStart; sy < syEnd; sy++ {
+			srcRow := srcLinear[(sy-syStart)*srcLinearStride:]
+			dstRow := intermediate[(sy-syStart)*intermediateStride:]
+			horzRow16NRGBATileOffset(dstRow, srcRow, dxStart, dxEnd, sxStart, hTT, hFT, hSLcmLen, hDLcmLen)
+		}
+
+		// Downscale tile (vertical pass) and convert back to gamma space (premultiply for RGBA)
+		for dx := dxStart; dx < dxEnd; dx++ {
+			vertCol16RGBATileToGamma(dest.Pix, intermediate, t16,
+				dx, dyStart, dyEnd,
+				dx-dxStart, syStart,
+				vTT, vFT, vSLcmLen, vDLcmLen,
+				dwx4, intermediateStride)
+		}
+
+		_ = tileH
+	}
+}
+
+// vertCol16RGBATileToGamma combines vertical downscaling with gamma conversion and premultiply
+func vertCol16RGBATileToGamma(d []byte, s []uint16, t16 [65536]uint8,
+	dx, dyStart, dyEnd uint32,
+	sx, syStart uint32,
+	tt, ft []uint32, slcmlen, dlcmlen uint64,
+	dStride, sStride uint32) {
+
+	di := dyStart*dStride + (dx << 2)
+
+	fr := uint64(0)
+	if dyStart > 0 {
+		fr = uint64(ft[dyStart-1])
+	}
+
+	for dy := dyStart; dy < dyEnd; dy++ {
+		tl, tr := tt[dy], tt[dy+1]
+		fl := slcmlen - fr
+		fr = uint64(ft[dy])
+
+		var a, r, g, b, w uint64
+		si := (tl - syStart) * sStride + (sx << 2)
+
+		if fl != 0 {
+			w = uint64(s[si+3]) * fl
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+			si += sStride
+		}
+		for i := tl + 1; i < tr; i++ {
+			w = uint64(s[si+3]) * slcmlen
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+			si += sStride
+		}
+		if fr != 0 {
+			w = uint64(s[si+3]) * fr
+			r += uint64(s[si+0]) * w
+			g += uint64(s[si+1]) * w
+			b += uint64(s[si+2]) * w
+			a += w
+		}
+
+		if a > 0 {
+			aOut := a / dlcmlen >> 8
+			if aOut == 255 {
+				d[di+3] = 255
+				d[di+0] = t16[r/a]
+				d[di+1] = t16[g/a]
+				d[di+2] = t16[b/a]
+			} else if aOut > 0 {
+				d[di+3] = uint8(aOut)
+				premul := uint32(aOut) * 32897
+				d[di+0] = uint8(uint32(t16[r/a]) * premul >> 23)
+				d[di+1] = uint8(uint32(t16[g/a]) * premul >> 23)
+				d[di+2] = uint8(uint32(t16[b/a]) * premul >> 23)
+			} else {
+				d[di+0] = 0
+				d[di+1] = 0
+				d[di+2] = 0
+				d[di+3] = 0
+			}
+		} else {
+			d[di+0] = 0
+			d[di+1] = 0
+			d[di+2] = 0
+			d[di+3] = 0
+		}
+		di += dStride
+	}
+}
